@@ -1,0 +1,9 @@
+name: astrbot_plugin_summary
+display_name: 群聊消息回顾总结
+desc: 根据关键词回溯最近一两天内的群聊记录，并生成总结。
+short_desc: 输入 /回顾 关键词，机器人自动总结相关讨论。
+author: YourName
+version: 1.0.0
+repo: https://github.com/yourname/astrbot_plugin_summary
+support_platforms:
+  - aiocqhttp
