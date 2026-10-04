@@ -1,4 +1,5 @@
 import time
+import json
 from datetime import datetime, date
 from typing import List, Optional, Tuple, Dict
 
@@ -6,7 +7,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
 from astrbot.api.message_components import Reply
-
+import coverage
 class PluginSummary(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -14,96 +15,93 @@ class PluginSummary(Star):
         self.max_messages = 1000
         self.max_text_chars = 50000
         self.max_images = 20
-    async def _send_as_forward(self, event: AstrMessageEvent, text: str, title: str = ""):
-        """将长文本以合并转发形式发送，超出单节点上限则自动拆分"""
-        if not text:
-            return
+        logger.info("[BRANCH] PluginSummary __init__ 完成")
+                # 启动 coverage，只统计本插件目录
+        self.cov = coverage.Coverage(source=['.'])  # 或者写插件所在目录的绝对路径
+        self.cov.start()
+        logger.info("[BRANCH] Coverage started")
 
-        # 拼接标题和正文
-        full_content = f"{title}\n\n{text}" if title else text
-        max_len = 4500  # 单节点文本上限
-
-        # 按固定长度拆分
-        chunks = [full_content[i:i+max_len] for i in range(0, len(full_content), max_len)]
-
-        # 构造合并转发节点
-        nodes = []
-        bot_name = "Bot"   # 可改成你的机器人名字
-        bot_uin = "10086"  # 可改成你的机器人QQ号
-
-        for chunk in chunks:
-            nodes.append({
-                "type": "node",
-                "data": {
-                    "name": bot_name,
-                    "uin": bot_uin,
-                    "content": [{"type": "text", "data": {"text": chunk}}]
-                }
-            })
-
-        # 获取 client 用于 API 调用
-        platform = self.context.get_platform('aiocqhttp')
-        if not platform:
-            # 降级为普通发送
-            for chunk in chunks:
-                await event.send(event.plain_result(chunk))
-            return
-
-        client = None
-        if hasattr(platform, 'get_client'):
-            client = platform.get_client()
-        elif hasattr(platform, 'client'):
-            client = platform.client
-        elif hasattr(event, 'bot'):
-            client = event.bot
-
-        if not client:
-            # 降级
-            for chunk in chunks:
-                await event.send(event.plain_result(chunk))
-            return
-
-        group_id = event.message_obj.group_id
-        if not group_id:
-            await event.send(event.plain_result(text))
-            return
-
-        # 发送合并转发
+    # ---------- 辅助：获取引用消息文本 ----------
+    async def _get_reply_text(self, client, reply_id) -> str:
+        logger.info(f"[BRANCH] _get_reply_text 进入, reply_id={reply_id}, type={type(reply_id)}")
         try:
-            await client.api.call_action(
-                'send_group_forward_msg',
-                **{
-                    'group_id': int(group_id),
-                    'messages': nodes
-                }
-            )
+            msg_id = int(reply_id)
+            logger.info(f"[BRANCH] _get_reply_text 转换成功: {msg_id}")
         except Exception as e:
-            logger.error(f"发送合并转发失败: {e}")
-            # 降级为逐条发送
-            for chunk in chunks:
-                await event.send(event.plain_result(chunk))
+            logger.info(f"[BRANCH] _get_reply_text 转换失败: {e}")
+            return "[引用消息ID无效]"
+        try:
+            logger.info("[BRANCH] _get_reply_text 调用 get_msg API")
+            resp = await client.api.call_action('get_msg', message_id=msg_id)
+            logger.info(f"[BRANCH] _get_reply_text 响应类型: {type(resp)}")
+            if not resp:
+                logger.info("[BRANCH] _get_reply_text 响应为空")
+                return "[引用消息获取失败]"
+            sender_info = resp.get('sender', {})
+            sender = sender_info.get('card') or sender_info.get('nickname') or str(sender_info.get('user_id', '未知'))
+            content = resp.get('message', [])
+            texts = []
+            for seg in content:
+                if isinstance(seg, dict):
+                    seg_type = seg.get('type')
+                    data = seg.get('data', {})
+                else:
+                    seg_type = getattr(seg, 'type', '')
+                    data = getattr(seg, 'data', {})
+                if seg_type == 'text':
+                    texts.append(data.get('text', ''))
+                elif seg_type == 'image':
+                    texts.append('[图片]')
+                else:
+                    logger.info(f"[BRANCH] _get_reply_text 忽略非文本/图片段: {seg_type}")
+            text_content = ''.join(texts).strip() or '[空消息]'
+            result = f"回复 @{sender}: {text_content}"
+            logger.info(f"[BRANCH] _get_reply_text 成功: {result[:50]}...")
+            return result
+        except Exception as e:
+            logger.warning(f"[BRANCH] _get_reply_text 异常: {e}")
+            return "[引用消息获取失败]"
+
     # ---------- 消息解析（递归展开合并转发） ----------
     async def _parse_messages(self, messages: list, client, depth: int, image_counter: list, image_urls: list) -> List[str]:
+        logger.info(f"[BRANCH] _parse_messages 进入, depth={depth}, 消息数={len(messages)}")
+        if messages:
+            logger.info(f"[BRANCH] _parse_messages 第一条消息类型: {type(messages[0])}")
         result = []
-        for msg in messages:
-            # 在 _parse_messages 方法中，找到获取 sender 的地方（大约在第 43 行）
-            # 原代码：
-            # sender = msg.get('sender', {}).get('nickname', msg.get('sender', {}).get('user_id', '未知'))
-
-            # 修改为：
+        for idx, msg in enumerate(messages):
+            logger.info(f"[BRANCH] _parse_messages 处理消息 #{idx+1}")
             sender_info = msg.get('sender', {})
             sender = sender_info.get('card') or sender_info.get('nickname') or str(sender_info.get('user_id', '未知'))
             content = msg.get('message', msg.get('content', []))
+            if isinstance(content, list):
+                logger.info(f"[BRANCH] _parse_messages content 是 list, 长度={len(content)}")
+            else:
+                logger.info(f"[BRANCH] _parse_messages content 不是 list, 类型={type(content)}")
             text_parts = []
             nested_parts = []
-            for seg in content:
-                seg_type = seg.type if hasattr(seg, 'type') else seg.get('type')
-                seg_type_str = seg_type.value if hasattr(seg_type, 'value') else str(seg_type)
+
+            for seg_idx, seg in enumerate(content):
+                seg_type = None
+                data = {}
+                if isinstance(seg, dict):
+                    seg_type = seg.get('type')
+                    data = seg.get('data', {})
+                else:
+                    logger.info(f"[BRANCH] _parse_messages seg 不是 dict, 类型={type(seg)}")
+                    if hasattr(seg, 'type'):
+                        seg_type = seg.type
+                        data = seg.data if hasattr(seg, 'data') else {}
+                    else:
+                        seg_type = getattr(seg, 'type', None)
+                        data = getattr(seg, 'data', {})
+                seg_type_str = str(seg_type) if seg_type is not None else ''
+                logger.info(f"[BRANCH] _parse_messages 段 #{seg_idx+1} type='{seg_type_str}'")
+
                 if seg_type_str == 'text':
-                    data = seg.data if hasattr(seg, 'data') else seg.get('data', {})
+                    logger.info("[BRANCH] _parse_messages -> 分支: text")
                     text_parts.append(data.get('text', ''))
                 elif seg_type_str == 'image':
-                    data = seg.data if hasattr(seg, 'data') else seg.get('data', {})
+                    logger.info("[BRANCH] _parse_messages -> 分支: image")
                     url = data.get('url', '')
                     if url:
                         img_num = image_counter[0]
@@ -111,19 +109,32 @@ class PluginSummary(Star):
                         text_parts.append(f"[图#{img_num}]")
                         if image_urls is not None:
                             image_urls.append(url)
+                    else:
+                        logger.info("[BRANCH] _parse_messages image 无 url")
                 elif seg_type_str == 'forward':
-                    data = seg.data if hasattr(seg, 'data') else seg.get('data', {})
+                    logger.info("[BRANCH] _parse_messages -> 分支: forward")
                     if 'content' in data and data['content']:
+                        logger.info("[BRANCH] _parse_messages forward 有 content 字段，递归解析")
                         nested = await self._parse_messages(data['content'], client, depth + 1, image_counter, image_urls)
                         if nested:
                             nested_str = " | ".join(nested)
                             nested_parts.append(f"( {nested_str} )")
                     elif 'id' in data:
-                        nested_id = data['id']
-                        nested = await self._extract_forward_msg(client, nested_id, depth + 1, image_counter, image_urls)
+                        logger.info(f"[BRANCH] _parse_messages forward 有 id 字段，调用 _extract_forward_msg, id={data['id']}")
+                        nested = await self._extract_forward_msg(client, data['id'], depth + 1, image_counter, image_urls)
                         if nested:
                             nested_str = " | ".join(nested)
                             nested_parts.append(f"( {nested_str} )")
+                    else:
+                        logger.info("[BRANCH] _parse_messages forward 既无 content 也无 id，跳过")
+                elif seg_type_str == 'reply':
+                    # 合并转发内的引用直接摆烂，不查找任何消息
+                    logger.info("[BRANCH] _parse_messages -> 分支: reply，直接忽略引用内容")
+                    text_parts.append("[引用]")
+                else:
+                    logger.info(f"[BRANCH] _parse_messages -> 其他类型: {seg_type_str}")
+
+            # 组装该消息的文本
             has_self = bool(text_parts)
             self_str = ""
             if has_self:
@@ -131,116 +142,271 @@ class PluginSummary(Star):
             nested_combined = " ".join(nested_parts) if nested_parts else ""
             if has_self and nested_combined:
                 result.append(f"{self_str} {nested_combined}")
+                logger.info(f"[BRANCH] _parse_messages 组装结果: 有自身文本且有嵌套")
             elif has_self:
                 result.append(self_str)
+                logger.info(f"[BRANCH] _parse_messages 组装结果: 仅自身文本")
             elif nested_combined:
                 result.append(nested_combined)
+                logger.info(f"[BRANCH] _parse_messages 组装结果: 仅嵌套")
+            else:
+                logger.info(f"[BRANCH] _parse_messages 组装结果: 空消息，不添加")
+        logger.info(f"[BRANCH] _parse_messages 返回 {len(result)} 条")
         return result
-
     async def _extract_forward_msg(self, client, forward_id: str, depth: int = 0, image_counter: list = None, image_urls: list = None) -> List[str]:
+        logger.info(f"[BRANCH] _extract_forward_msg 进入, forward_id={forward_id}, depth={depth}")
         if depth > 5:
+            logger.info("[BRANCH] _extract_forward_msg 嵌套过深，返回")
             return ["[合并转发嵌套过深]"]
         try:
+            logger.info("[BRANCH] _extract_forward_msg 调用 get_forward_msg")
             resp = await client.api.call_action('get_forward_msg', id=str(forward_id))
+            logger.info(f"[BRANCH] _extract_forward_msg 响应类型: {type(resp)}")
             messages = []
             if isinstance(resp, dict):
                 if 'messages' in resp:
                     messages = resp['messages']
+                    logger.info("[BRANCH] _extract_forward_msg 从 resp['messages'] 获取")
                 elif 'message' in resp:
                     messages = resp['message']
+                    logger.info("[BRANCH] _extract_forward_msg 从 resp['message'] 获取")
                 elif 'data' in resp and isinstance(resp['data'], dict):
                     messages = resp['data'].get('messages', resp['data'].get('message', []))
+                    logger.info("[BRANCH] _extract_forward_msg 从 resp['data'] 中获取")
+                else:
+                    logger.info("[BRANCH] _extract_forward_msg 未找到 messages 字段")
+            else:
+                logger.info("[BRANCH] _extract_forward_msg 响应不是 dict")
             if not messages:
+                logger.info("[BRANCH] _extract_forward_msg messages 为空")
                 return ["[合并转发内容为空]"]
-            return await self._parse_messages(messages, client, depth + 1, image_counter, image_urls)
+            logger.info(f"[BRANCH] _extract_forward_msg 获取到 {len(messages)} 条内部消息")
+            # 不再向 cache 添加索引
+            result = await self._parse_messages(messages, client, depth + 1, image_counter, image_urls)
+            logger.info(f"[BRANCH] _extract_forward_msg 返回 {len(result)} 条")
+            return result
         except Exception as e:
-            logger.error(f"展开合并转发失败: {e}")
+            logger.error(f"[BRANCH] _extract_forward_msg 异常: {e}")
             return ["[合并转发展开失败]"]
+    # ---------- 发送合并转发 ----------
+    async def _send_as_forward(self, event: AstrMessageEvent, text: str, title: str = ""):
+        logger.info("[BRANCH] _send_as_forward 进入")
+        if not text:
+            logger.info("[BRANCH] _send_as_forward text 为空，直接返回")
+            return
+
+        full_content =  text
+        max_len = 3000
+        chunks = [full_content[i:i+max_len] for i in range(0, len(full_content), max_len)]
+        logger.info(f"[BRANCH] _send_as_forward 拆分为 {len(chunks)} 块")
+
+        nodes = []
+        bot_user_id = 10086
+        for chunk in chunks:
+            nodes.append({
+                "type": "node",
+                "data": {
+                    "user_id": bot_user_id,
+                    "nickname": "Bot",
+                    "content": [{"type": "text", "data": {"text": chunk}}]
+                }
+            })
+
+        platform = self.context.get_platform('aiocqhttp')
+        if not platform:
+            logger.info("[BRANCH] _send_as_forward 未找到 aiocqhttp 平台，降级普通发送")
+            for chunk in chunks:
+                await event.send(event.plain_result(chunk))
+            return
+
+        client = None
+        if hasattr(platform, 'get_client'):
+            client = platform.get_client()
+            logger.info("[BRANCH] _send_as_forward 通过 get_client 获取 client")
+        elif hasattr(platform, 'client'):
+            client = platform.client
+            logger.info("[BRANCH] _send_as_forward 通过 platform.client 获取 client")
+        elif hasattr(event, 'bot'):
+            client = event.bot
+            logger.info("[BRANCH] _send_as_forward 通过 event.bot 获取 client")
+        if not client:
+            logger.info("[BRANCH] _send_as_forward client 获取失败，降级普通发送")
+            for chunk in chunks:
+                await event.send(event.plain_result(chunk))
+            return
+
+        group_id = event.message_obj.group_id
+        if not group_id:
+            logger.info("[BRANCH] _send_as_forward 无 group_id，降级普通发送")
+            for chunk in chunks:
+                await event.send(event.plain_result(text))
+            return
+
+        try:
+            logger.info("[BRANCH] _send_as_forward 调用 send_group_forward_msg")
+            await client.api.call_action(
+                'send_group_forward_msg',
+                **{
+                    'group_id': int(group_id),
+                    'message': nodes
+                }
+            )
+            logger.info("[BRANCH] _send_as_forward 发送成功")
+        except Exception as e:
+            logger.error(f"[BRANCH] _send_as_forward 发送合并转发失败: {e}")
+            for chunk in chunks:
+                await event.send(event.plain_result(chunk))
 
     # ---------- 拉取消息并过滤 ----------
     async def _fetch_and_filter(self, client, group_id: int, start_time: Optional[int] = None, end_time: Optional[int] = None, self_id: Optional[int] = None):
+        logger.info(f"[BRANCH] _fetch_and_filter 进入, group_id={group_id}, start_time={start_time}, end_time={end_time}, self_id={self_id}")
         now = time.time()
         if start_time is None:
             start_time = now - self.default_days * 86400
+            logger.info(f"[BRANCH] _fetch_and_filter start_time 为 None，设为 {start_time}")
         if end_time is None:
             end_time = now
+            logger.info(f"[BRANCH] _fetch_and_filter end_time 为 None，设为 {end_time}")
 
         all_messages = []
-        next_seq = None
+        seen_message_ids = set()   # 分页去重用
+        next_anchor = None         # SnowLuma 用 message_id 做历史锚点
         max_loops = 20
-        per_page = 1000
+        per_page = 200             # SnowLuma 单次上限约 200，写 1000 也会被截断
 
-        logger.info(f"[分页拉取] 目标区间: {datetime.fromtimestamp(start_time)} ~ {datetime.fromtimestamp(end_time)}")
+        logger.info(f"[BRANCH] _fetch_and_filter 目标区间: {datetime.fromtimestamp(start_time)} ~ {datetime.fromtimestamp(end_time)}")
 
         while max_loops > 0:
+            logger.info(f"[BRANCH] _fetch_and_filter 循环第 {21-max_loops} 次, next_anchor={next_anchor}")
             params = {'group_id': int(group_id), 'count': per_page}
-            if next_seq is not None:
-                params['message_seq'] = next_seq
+            if next_anchor is not None:
+                # SnowLuma 锚点参数名是 message_id（可能为负），不是 message_seq
+                params['message_id'] = next_anchor
                 params['reverse_order'] = True
+                logger.info(f"[BRANCH] _fetch_and_filter 使用 message_id={next_anchor} 和 reverse_order=True")
 
             resp = await client.api.call_action('get_group_msg_history', **params)
+            logger.info(f"[BRANCH] _fetch_and_filter 响应类型: {type(resp)}")
 
             if isinstance(resp, dict) and 'messages' in resp:
                 msgs = resp['messages']
+                logger.info("[BRANCH] _fetch_and_filter 从 resp['messages'] 获取")
             elif isinstance(resp, dict) and 'data' in resp and isinstance(resp['data'], dict):
                 msgs = resp['data'].get('messages', [])
+                logger.info("[BRANCH] _fetch_and_filter 从 resp['data']['messages'] 获取")
             else:
+                logger.info("[BRANCH] _fetch_and_filter 无法解析响应，跳出")
                 break
 
             if not msgs:
+                logger.info("[BRANCH] _fetch_and_filter msgs 为空，跳出")
                 break
 
             msgs.sort(key=lambda x: x.get('time', 0))
-            all_messages.extend(msgs)
+
+            # SnowLuma 的 reverse_order=True 会“包含锚点本身”，必须去重
+            new_msgs = []
+            for m in msgs:
+                mid = m.get('message_id')
+                if mid is None:
+                    new_msgs.append(m)
+                    continue
+                if mid in seen_message_ids:
+                    continue
+                seen_message_ids.add(mid)
+                new_msgs.append(m)
+
+            all_messages.extend(new_msgs)
+            logger.info(f"[BRANCH] _fetch_and_filter 本次获取 {len(msgs)} 条（新增 {len(new_msgs)} 条），累计 {len(all_messages)} 条")
 
             oldest_in_batch = msgs[0]
             oldest_time = oldest_in_batch.get('time', 0)
-
             if oldest_time <= start_time:
-                logger.info(f"[分页拉取] 最旧消息 {datetime.fromtimestamp(oldest_time)} <= 起始时间，停止")
+                logger.info(f"[BRANCH] _fetch_and_filter 最旧时间 {oldest_time} <= start_time，停止")
                 break
 
-            if 'message_seq' in oldest_in_batch:
-                next_seq = oldest_in_batch['message_seq']
-            else:
-                next_seq = oldest_in_batch.get('time')
-                if next_seq is None:
-                    break
+            oldest_mid = oldest_in_batch.get('message_id')
+            if oldest_mid is None:
+                logger.info("[BRANCH] _fetch_and_filter 最旧消息无 message_id，无法继续翻页，停止")
+                break
+
+            # 若本批最旧消息 == 上一轮锚点，说明已经没有更旧的消息了
+            if next_anchor is not None and oldest_mid == next_anchor:
+                logger.info(f"[BRANCH] _fetch_and_filter 最旧消息仍为锚点 {oldest_mid}，无更旧消息，停止")
+                break
+
+            next_anchor = oldest_mid
+            logger.info(f"[BRANCH] _fetch_and_filter 设置 next_anchor={next_anchor}")
 
             max_loops -= 1
+        else:
+            logger.info("[BRANCH] _fetch_and_filter 循环因 max_loops 耗尽退出")
 
-        logger.info(f"[分页拉取] 共拉取 {len(all_messages)} 条原始消息")
+        logger.info(f"[BRANCH] _fetch_and_filter 共拉取 {len(all_messages)} 条原始消息")
 
-        # 整体按时间升序排序
-        all_messages.sort(key=lambda x: x.get('time', 0))
-
-        #  过滤掉机器人自己的消息 
         if self_id is not None:
+            original_len = len(all_messages)
             all_messages = [m for m in all_messages if m.get('sender', {}).get('user_id') != self_id]
-            logger.info(f"[分页拉取] 过滤后剩余 {len(all_messages)} 条消息（已排除机器人自身）")
+            logger.info(f"[BRANCH] _fetch_and_filter 过滤机器人自身，过滤前 {original_len}，过滤后 {len(all_messages)}")
+        else:
+            logger.info("[BRANCH] _fetch_and_filter self_id 为 None，不进行过滤")
 
-        # 按时间范围过滤
         filtered = [m for m in all_messages if start_time <= m.get('time', 0) <= end_time]
         if not filtered:
+            logger.info("[BRANCH] _fetch_and_filter filtered 为空")
             if all_messages:
-                logger.info(f"[分页拉取] 消息时间跨度: {datetime.fromtimestamp(all_messages[0].get('time', 0))} ~ {datetime.fromtimestamp(all_messages[-1].get('time', 0))}")
-                logger.info(f"[分页拉取] 目标区间内无匹配消息")
+                logger.info(f"[BRANCH] _fetch_and_filter 消息时间跨度: {datetime.fromtimestamp(all_messages[0].get('time', 0))} ~ {datetime.fromtimestamp(all_messages[-1].get('time', 0))}")
+                logger.info("[BRANCH] _fetch_and_filter 目标区间内无匹配消息")
             return "", [], 0
+        else:
+            logger.info(f"[BRANCH] _fetch_and_filter filtered 数量: {len(filtered)}")
 
-        # 后续解析消息（保持不变）
         filtered.sort(key=lambda x: x.get('time', 0))
+        # 打印完整消息列表（保留）
+        logger.info("=" * 60)
+        logger.info("【完整消息列表】开始打印所有拉取到的消息")
+        for idx, msg in enumerate(filtered):
+            logger.info(f"--- 消息 {idx+1}/{len(filtered)} ---")
+            try:
+                msg_str = json.dumps(msg, ensure_ascii=False, indent=2, default=str)
+            except Exception:
+                msg_str = str(msg)
+            logger.info(msg_str)
+        logger.info("【完整消息列表】打印完毕")
+        logger.info("=" * 60)
+
+        # 构建消息缓存（保留观察）
+        msg_cache = {}
+        for m in all_messages:
+            msg_id = m.get('message_id')
+            if msg_id is not None:
+                try:
+                    msg_cache[int(msg_id)] = m
+                except (ValueError, TypeError):
+                    pass
+            msg_seq = m.get('message_seq')
+            if msg_seq is not None:
+                try:
+                    msg_cache[int(msg_seq)] = m
+                except (ValueError, TypeError):
+                    pass
+        logger.info(f"[BRANCH] _fetch_and_filter 缓存构建完成，条目数: {len(msg_cache)}")
+        if msg_cache:
+            sample_keys = list(msg_cache.keys())[:5]
+            sample_msg = msg_cache[sample_keys[0]]
+            logger.info(f"[BRANCH] _fetch_and_filter 示例键: {sample_keys}")
+            logger.info(f"[BRANCH] _fetch_and_filter 示例消息字段: {list(sample_msg.keys())}")
+        else:
+            logger.warning("[BRANCH] _fetch_and_filter 缓存为空")
+
+        # 解析每条消息
         msg_texts = []
         all_images = []
         image_counter = [1]
 
-        for msg in filtered:
-            # 在 _fetch_and_filter 方法中，找到获取 sender 的地方（大约在第 146 行）
-            # 原代码：
-            # sender = msg.get('sender', {}).get('nickname', msg.get('sender', {}).get('user_id', '未知'))
-
-            # 修改为：
+        for idx, msg in enumerate(filtered):
+            logger.info(f"[BRANCH] _fetch_and_filter 解析消息 #{idx+1}")
             sender_info = msg.get('sender', {})
-            # 优先使用群名片(card)，如果没有则使用昵称(nickname)，最后才用 QQ号
             sender = sender_info.get('card') or sender_info.get('nickname') or str(sender_info.get('user_id', '未知'))
             ts = datetime.fromtimestamp(msg.get('time', 0)).strftime('%Y-%m-%d %H:%M:%S')
             msg_content = msg.get('message', [])
@@ -248,32 +414,97 @@ class PluginSummary(Star):
             images = []
             forward_texts = []
 
-            for seg in msg_content:
-                seg_type = seg.type if hasattr(seg, 'type') else seg.get('type')
-                seg_type_str = seg_type.value if hasattr(seg_type, 'value') else str(seg_type)
+            for seg_idx, seg in enumerate(msg_content):
+                # if isinstance(seg, dict):
+                seg_type = seg.get('type')
+                data = seg.get('data', {})
+                # else:
+                    # seg_type = getattr(seg, 'type', '')
+                    # data = getattr(seg, 'data', {})
+                seg_type_str = str(seg_type) if seg_type is not None else ''
+                logger.info(f"[BRANCH] _fetch_and_filter 消息#{idx+1} 段#{seg_idx+1} type='{seg_type_str}'")
 
                 if seg_type_str == 'text':
-                    data = seg.data if hasattr(seg, 'data') else seg.get('data', {})
+                    logger.info("[BRANCH] _fetch_and_filter -> text")
                     text += data.get('text', '')
                 elif seg_type_str == 'image':
+                    logger.info("[BRANCH] _fetch_and_filter -> image")
                     url = self._extract_image_urls([seg])
                     if url:
                         images.extend(url)
                 elif seg_type_str == 'forward':
+                    logger.info("[BRANCH] _fetch_and_filter -> forward")
                     forward_id = None
-                    if hasattr(seg, 'data'):
-                        data = seg.data if hasattr(seg, 'data') else seg.get('data', {})
-                        if hasattr(data, 'id'):
-                            forward_id = data.id
-                        elif isinstance(data, dict) and 'id' in data:
-                            forward_id = data['id']
-                    elif isinstance(seg, dict):
-                        data = seg.get('data', {})
-                        forward_id = data.get('id')
+                    # if isinstance(seg, dict):
+                    data = seg.get('data', {})
+                    forward_id = data.get('id')
+                    # else:
+                        # if hasattr(seg, 'data'):
+                            # data = seg.data if hasattr(seg, 'data') else {}
+                            # if hasattr(data, 'id'):
+                                # forward_id = data.id
+                            # elif isinstance(data, dict):
+                                # forward_id = data.get('id')
                     if forward_id:
+                        logger.info(f"[BRANCH] _fetch_and_filter forward_id={forward_id}, 调用 _extract_forward_msg")
                         expanded = await self._extract_forward_msg(client, forward_id, image_counter=image_counter, image_urls=all_images)
                         forward_texts.extend(expanded)
+                    else:
+                        logger.info("[BRANCH] _fetch_and_filter forward 无 id，跳过")
+                elif seg_type_str == 'reply':
+                    logger.info("[BRANCH] _fetch_and_filter -> reply")
+                    data = seg.get('data', {}) if isinstance(seg, dict) else getattr(seg, 'data', {})
+                    reply_seq = data.get('seq')
+                    reply_id = data.get('id')
+                    reply_key = None
+                    if reply_seq is not None:
+                        try:
+                            reply_key = int(reply_seq)
+                            logger.info(f"[BRANCH] _fetch_and_filter 使用 seq={reply_seq} 作为 key")
+                        except:
+                            pass
+                    if reply_key is None and reply_id is not None:
+                        try:
+                            reply_key = int(reply_id)
+                            logger.info(f"[BRANCH] _fetch_and_filter 使用 id={reply_id} 作为 key")
+                        except:
+                            pass
+                    if reply_key is not None:
+                        matched_msg = None
+                        # 尝试从 seq_cache（当前层）查找（但在 _fetch_and_filter 里没有 seq_cache，所以直接查 msg_cache）
+                        if reply_key in msg_cache:
+                            matched_msg = msg_cache[reply_key]
+                            logger.info(f"[BRANCH] _fetch_and_filter 在 msg_cache 中命中 key={reply_key}")
+                        if matched_msg:
+                            sender_info_reply = matched_msg.get('sender', {})
+                            sender_reply = sender_info_reply.get('card') or sender_info_reply.get('nickname') or str(sender_info_reply.get('user_id', '未知'))
+                            content_reply = matched_msg.get('message', [])
+                            texts = []
+                            for seg_inner in content_reply:
+                                if isinstance(seg_inner, dict):
+                                    seg_type_inner = seg_inner.get('type')
+                                    data_inner = seg_inner.get('data', {})
+                                else:
+                                    seg_type_inner = getattr(seg_inner, 'type', '')
+                                    data_inner = getattr(seg_inner, 'data', {})
+                                if seg_type_inner == 'text':
+                                    texts.append(data_inner.get('text', ''))
+                                elif seg_type_inner == 'image':
+                                    texts.append('[图片]')
+                            text_content = ''.join(texts).strip() or '[空消息]'
+                            reply_text = f"回复 @{sender_reply}: {text_content}"
+                        else:
+                            logger.info("[BRANCH] _fetch_and_filter reply 缓存未命中，调用 API 降级")
+                            fallback_id = reply_id or reply_seq
+                            reply_text = await self._get_reply_text(client, fallback_id)
+                        text += reply_text
+                    else:
+                        logger.info("[BRANCH] _fetch_and_filter reply 无有效 key")
+                        text += "[回复消息ID无效]"
+                else:
+                    logger.info(f"[BRANCH] _fetch_and_filter 其他类型: {seg_type_str}")
 
+            # 处理合并转发文本
             if forward_texts:
                 forward_summary = " [合并转发] " + " | ".join(forward_texts)
                 if text:
@@ -286,6 +517,7 @@ class PluginSummary(Star):
                 msg_parts.append(text)
             for img_url in images:
                 if len(all_images) >= self.max_images:
+                    logger.info(f"[BRANCH] _fetch_and_filter 图片已达上限 {self.max_images}，停止添加")
                     break
                 all_images.append(img_url)
                 msg_parts.append(f"[图#{image_counter[0]}]")
@@ -293,201 +525,224 @@ class PluginSummary(Star):
 
             if msg_parts:
                 msg_texts.append(f"[{ts}] {sender}: {' '.join(msg_parts)}")
+                logger.info(f"[BRANCH] _fetch_and_filter 消息#{idx+1} 组装成功: {msg_parts[0][:30]}...")
             else:
                 msg_texts.append(f"[{ts}] {sender}: [空消息]")
+                logger.info(f"[BRANCH] _fetch_and_filter 消息#{idx+1} 为空消息")
 
         if not msg_texts:
+            logger.info("[BRANCH] _fetch_and_filter msg_texts 为空，返回空")
             return "", [], 0
 
         full_text = "\n".join(msg_texts)
         if len(full_text) > self.max_text_chars:
             full_text = full_text[-self.max_text_chars:]
             full_text = "（消息过多已截断）\n" + full_text
+            logger.info("[BRANCH] _fetch_and_filter 截断消息")
 
+        logger.info("[BRANCH] _fetch_and_filter 返回成功")
         return full_text, all_images, len(msg_texts)
 
     # ---------- 统一准备消息（含引用检测） ----------
     async def _prepare_messages(self, event: AstrMessageEvent, start_time: Optional[int] = None, end_time: Optional[int] = None):
+        logger.info("[BRANCH] _prepare_messages 进入")
         if not event.message_obj.group_id:
+            logger.info("[BRANCH] _prepare_messages 非群聊，抛出异常")
             raise ValueError("此指令只能在群聊中使用。")
         group_id = event.message_obj.group_id
+        logger.info(f"[BRANCH] _prepare_messages group_id={group_id}")
 
         platform = self.context.get_platform('aiocqhttp')
-        if not platform:
-            raise ValueError("未找到 QQ 平台适配器。")
-        client = None
-        if hasattr(platform, 'get_client'):
-            client = platform.get_client()
-        elif hasattr(platform, 'client'):
-            client = platform.client
-        elif hasattr(event, 'bot'):
-            client = event.bot
-        if not client:
-            raise ValueError("无法获取 QQ 协议端 API 客户端。")
+        # if not platform:
+            # logger.info("[BRANCH] _prepare_messages 未找到 aiocqhttp 平台，抛出异常")
+            # raise ValueError("未找到 QQ 平台适配器。")
+        # client = None
+        # if hasattr(platform, 'get_client'):
+        client = platform.get_client()
+            # logger.info("[BRANCH] _prepare_messages 通过 get_client 获取 client")
+        # elif hasattr(platform, 'client'):
+            # client = platform.client
+            # logger.info("[BRANCH] _prepare_messages 通过 platform.client 获取 client")
+        # elif hasattr(event, 'bot'):
+            # client = event.bot
+            # logger.info("[BRANCH] _prepare_messages 通过 event.bot 获取 client")
+        # if not client:
+            # logger.info("[BRANCH] _prepare_messages client 获取失败，抛出异常")
+            # raise ValueError("无法获取 QQ 协议端 API 客户端。")
 
-        # 检测引用消息（覆盖 start_time）
         reply_seg = None
         for seg in event.message_obj.message:
             if isinstance(seg, Reply):
                 reply_seg = seg
+                logger.info("[BRANCH] _prepare_messages 检测到 Reply 引用段")
                 break
         if reply_seg:
             try:
+                logger.info(f"[BRANCH] _prepare_messages 尝试获取引用消息详情, id={reply_seg.id}")
                 msg_resp = await client.api.call_action('get_msg', message_id=int(reply_seg.id))
                 if msg_resp and 'time' in msg_resp:
                     start_time = msg_resp['time']
-                    logger.info(f"检测到引用消息，时间戳: {start_time}，将从此时间开始回溯。")
+                    logger.info(f"[BRANCH] _prepare_messages 引用消息时间戳={start_time}")
+                else:
+                    logger.info("[BRANCH] _prepare_messages 引用消息响应无 time 字段")
             except Exception as e:
-                logger.warning(f"获取引用消息详情失败: {e}")
+                logger.warning(f"[BRANCH] _prepare_messages 获取引用消息详情失败: {e}")
+        else:
+            logger.info("[BRANCH] _prepare_messages 无引用消息")
 
-        #  获取机器人自己的ID并传给 _fetch_and_filter 
         self_id = event.message_obj.self_id
+        logger.info(f"[BRANCH] _prepare_messages 获取 self_id={self_id}")
         return await self._fetch_and_filter(client, group_id, start_time, end_time, self_id)
 
     # ---------- 灵活的时间解析 ----------
     def _parse_time_str(self, time_str: str) -> Dict[str, Optional[int]]:
-        """
-        解析时间字符串，返回 {'year': int|None, 'month': int|None, 'day': int|None, 'hour': int|None, 'minute': int|None}
-        支持格式：
-          - YYYY-MM-DD
-          - YYYY-MM-DD HH:MM   (空格已替换为下划线或T)
-          - YYYY-MM-DD_HH:MM
-          - YYYY-MM-DDTHH:MM
-          - MM-DD
-          - HH:MM
-          - 空字符串 -> 全部为None
-        """
+        logger.info(f"[BRANCH] _parse_time_str 进入, time_str='{time_str}'")
         if not time_str:
+            logger.info("[BRANCH] _parse_time_str 空字符串，返回全 None")
             return {'year': None, 'month': None, 'day': None, 'hour': None, 'minute': None}
-        # 统一将下划线或T替换为空格
         s = time_str.replace('_', ' ').replace('T', ' ')
-        # 尝试完整日期时间
+        logger.info(f"[BRANCH] _parse_time_str 替换后: '{s}'")
         try:
-            # 如果有时间部分
             if ' ' in s:
                 date_part, time_part = s.split(' ', 1)
-                # 解析日期
+                logger.info(f"[BRANCH] _parse_time_str 日期部分='{date_part}', 时间部分='{time_part}'")
                 if '-' in date_part:
                     parts = date_part.split('-')
                     if len(parts) == 3:
                         year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+                        logger.info(f"[BRANCH] _parse_time_str 完整日期: year={year}, month={month}, day={day}")
                     elif len(parts) == 2:
-                        # 只有月日，年用None
                         month, day = int(parts[0]), int(parts[1])
                         year = None
+                        logger.info(f"[BRANCH] _parse_time_str 月日: month={month}, day={day}")
                     else:
                         raise ValueError
                 else:
                     raise ValueError
-                # 解析时间
                 if ':' in time_part:
                     hour, minute = map(int, time_part.split(':'))
+                    logger.info(f"[BRANCH] _parse_time_str 时间: hour={hour}, minute={minute}")
                 else:
                     hour = minute = None
                 return {'year': year, 'month': month, 'day': day, 'hour': hour, 'minute': minute}
             else:
-                # 只有日期或时间
                 if '-' in s:
                     parts = s.split('-')
                     if len(parts) == 3:
                         year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+                        logger.info(f"[BRANCH] _parse_time_str 仅日期 (完整): year={year}, month={month}, day={day}")
                         return {'year': year, 'month': month, 'day': day, 'hour': None, 'minute': None}
                     elif len(parts) == 2:
                         month, day = int(parts[0]), int(parts[1])
+                        logger.info(f"[BRANCH] _parse_time_str 仅日期 (月日): month={month}, day={day}")
                         return {'year': None, 'month': month, 'day': day, 'hour': None, 'minute': None}
                     else:
                         raise ValueError
                 elif ':' in s:
                     hour, minute = map(int, s.split(':'))
+                    logger.info(f"[BRANCH] _parse_time_str 仅时间: hour={hour}, minute={minute}")
                     return {'year': None, 'month': None, 'day': None, 'hour': hour, 'minute': minute}
                 else:
-                    # 可能只有年份？不处理
+                    logger.info("[BRANCH] _parse_time_str 无法匹配格式，抛出异常")
                     raise ValueError
-        except Exception:
-            # 解析失败，返回全None，后续会报错
+        except Exception as e:
+            logger.info(f"[BRANCH] _parse_time_str 解析异常: {e}，返回全 None")
             return {'year': None, 'month': None, 'day': None, 'hour': None, 'minute': None}
 
     def _normalize_times(self, start_dict: dict, end_dict: dict) -> Tuple[int, int]:
-        """
-        根据规则补全两个时间字典，返回两个Unix时间戳（秒）
-        """
+        logger.info("[BRANCH] _normalize_times 进入")
         today = date.today()
         current_year = today.year
         current_month = today.month
         current_day = today.day
+        logger.info(f"[BRANCH] _normalize_times 当前日期: {today}")
 
         # 补全年份
         if start_dict['year'] is None and end_dict['year'] is None:
             start_year = end_year = current_year
+            logger.info("[BRANCH] _normalize_times 两者年份均 None，使用当前年份")
         elif start_dict['year'] is not None and end_dict['year'] is None:
             start_year = end_year = start_dict['year']
+            logger.info(f"[BRANCH] _normalize_times start 有年份，end 无，使用 start 年份 {start_year}")
         elif start_dict['year'] is None and end_dict['year'] is not None:
             start_year = end_year = end_dict['year']
+            logger.info(f"[BRANCH] _normalize_times end 有年份，start 无，使用 end 年份 {end_year}")
         else:
             start_year = start_dict['year']
             end_year = end_dict['year']
+            logger.info(f"[BRANCH] _normalize_times 两者均有年份: start={start_year}, end={end_year}")
 
         # 补全月日
         if start_dict['month'] is None and start_dict['day'] is None:
-            # start无月日
             if end_dict['month'] is not None and end_dict['day'] is not None:
                 start_month, start_day = end_dict['month'], end_dict['day']
+                logger.info(f"[BRANCH] _normalize_times start 无月日，使用 end 月日: {start_month}-{start_day}")
             else:
                 start_month, start_day = current_month, current_day
+                logger.info(f"[BRANCH] _normalize_times start 无月日，end 也无，使用当前月日: {start_month}-{start_day}")
         else:
             start_month, start_day = start_dict['month'], start_dict['day']
+            logger.info(f"[BRANCH] _normalize_times start 月日: {start_month}-{start_day}")
 
         if end_dict['month'] is None and end_dict['day'] is None:
             if start_dict['month'] is not None and start_dict['day'] is not None:
                 end_month, end_day = start_dict['month'], start_dict['day']
+                logger.info(f"[BRANCH] _normalize_times end 无月日，使用 start 月日: {end_month}-{end_day}")
             else:
                 end_month, end_day = current_month, current_day
+                logger.info(f"[BRANCH] _normalize_times end 无月日，start 也无，使用当前月日: {end_month}-{end_day}")
         else:
             end_month, end_day = end_dict['month'], end_dict['day']
+            logger.info(f"[BRANCH] _normalize_times end 月日: {end_month}-{end_day}")
 
         # 补全时分
         start_hour = start_dict['hour'] if start_dict['hour'] is not None else 0
         start_minute = start_dict['minute'] if start_dict['minute'] is not None else 0
         end_hour = end_dict['hour'] if end_dict['hour'] is not None else 0
         end_minute = end_dict['minute'] if end_dict['minute'] is not None else 0
+        logger.info(f"[BRANCH] _normalize_times start 时间: {start_hour}:{start_minute}, end 时间: {end_hour}:{end_minute}")
 
-        # 构造datetime对象并转时间戳
         try:
             start_dt = datetime(start_year, start_month, start_day, start_hour, start_minute)
             end_dt = datetime(end_year, end_month, end_day, end_hour, end_minute)
+            logger.info(f"[BRANCH] _normalize_times 构造 datetime: start={start_dt}, end={end_dt}")
         except ValueError as e:
+            logger.info(f"[BRANCH] _normalize_times ValueError: {e}")
             raise ValueError(f"日期时间无效: {e}")
 
         return int(start_dt.timestamp()), int(end_dt.timestamp())
 
     # ---------- 参数解析 ----------
     def _parse_args(self, args: List[str]) -> dict:
-        """
-        参数格式： /回顾 开始时间 结束时间 关键词  (时间模式)
-                 /回顾 关键词              (引用模式)
-        时间字符串支持下划线或T代替空格。
-        """
+        logger.info(f"[BRANCH] _parse_args 进入, args={args}")
         if len(args) == 3:
+            logger.info("[BRANCH] _parse_args 模式: 3参数（时间模式）")
             start_str, end_str, keyword = args[0], args[1], args[2]
             start_dict = self._parse_time_str(start_str)
             end_dict = self._parse_time_str(end_str)
-            # 检查是否解析成功（至少应有月日或时间部分）
             if all(v is None for v in start_dict.values()) or all(v is None for v in end_dict.values()):
+                logger.info("[BRANCH] _parse_args 时间解析失败，抛出异常")
                 raise ValueError("时间格式无法解析，请使用 YYYY-MM-DD、YYYY-MM-DD_HH:MM、MM-DD 或 HH:MM")
             try:
                 start_ts, end_ts = self._normalize_times(start_dict, end_dict)
+                logger.info(f"[BRANCH] _parse_args 时间戳: start={start_ts}, end={end_ts}")
             except Exception as e:
+                logger.info(f"[BRANCH] _parse_args 时间补全失败: {e}")
                 raise ValueError(f"时间补全失败: {e}")
             if start_ts >= end_ts:
+                logger.info("[BRANCH] _parse_args 开始时间 >= 结束时间，抛出异常")
                 raise ValueError("开始时间必须早于结束时间")
             return {'mode': 'time', 'start': start_ts, 'end': end_ts, 'keyword': keyword}
         elif len(args) == 1:
+            logger.info("[BRANCH] _parse_args 模式: 1参数（引用模式）")
             return {'mode': 'quote', 'keyword': args[0]}
         else:
+            logger.info(f"[BRANCH] _parse_args 参数数量错误: {len(args)}，抛出异常")
             raise ValueError(f"参数数量错误（需要 1 个或 3 个，实际 {len(args)} 个）")
 
     # ---------- 辅助提取 ----------
     def _extract_plain_text(self, chain: List) -> str:
+        logger.info("[BRANCH] _extract_plain_text 进入")
         texts = []
         for seg in chain:
             if hasattr(seg, 'type'):
@@ -498,9 +753,12 @@ class PluginSummary(Star):
                 data = seg.get('data', {})
             if seg_type == 'text':
                 texts.append(data.get('text', ''))
-        return ''.join(texts).strip()
+        result = ''.join(texts).strip()
+        logger.info(f"[BRANCH] _extract_plain_text 返回: {result[:30]}...")
+        return result
 
     def _extract_image_urls(self, chain: List) -> List[str]:
+        logger.info("[BRANCH] _extract_image_urls 进入")
         urls = []
         for seg in chain:
             if hasattr(seg, 'type'):
@@ -517,49 +775,57 @@ class PluginSummary(Star):
                         url = file_val
                 if url:
                     urls.append(url)
+        logger.info(f"[BRANCH] _extract_image_urls 返回 {len(urls)} 个 URL")
         return urls
 
-    # ---------- 公共核心方法（所有共同逻辑） ----------
+    # ---------- 公共核心方法 ----------
     async def _execute_summary(self, event: AstrMessageEvent) -> Optional[tuple]:
-        """所有共同逻辑：参数解析、引用检查、消息拉取、日志输出。失败时发送错误消息并返回None。"""
-        logger.info("===== _execute_summary 被调用 =====")
+        logger.info("[BRANCH] _execute_summary 进入")
         raw = event.message_str.strip()
         parts = raw.split()
         if not parts:
+            logger.info("[BRANCH] _execute_summary 空指令，返回 None")
             await event.send(event.plain_result("无效指令。"))
             return None
         args = parts[1:]
         try:
             parsed = self._parse_args(args)
+            logger.info(f"[BRANCH] _execute_summary parsed = {parsed}")
         except ValueError as e:
+            logger.info(f"[BRANCH] _execute_summary 参数解析异常: {e}")
             await event.send(event.plain_result(f"参数错误：{str(e)}"))
             return None
 
         mode = parsed.get('mode')
         keyword = parsed.get('keyword')
         if not keyword:
+            logger.info("[BRANCH] _execute_summary keyword 为空，返回 None")
             await event.send(event.plain_result("关键词不能为空。"))
             return None
 
         if mode == 'quote':
             has_reply = any(isinstance(seg, Reply) for seg in event.message_obj.message)
             if not has_reply:
+                logger.info("[BRANCH] _execute_summary 引用模式下无引用，返回 None")
                 await event.send(event.plain_result("引用模式下必须引用一条群消息。"))
                 return None
+            else:
+                logger.info("[BRANCH] _execute_summary 引用模式有效")
 
         start_time = parsed.get('start') if mode == 'time' else None
         end_time = parsed.get('end') if mode == 'time' else None
 
-        await event.send(event.plain_result(f"正在检索与“{keyword}”相关的消息..."))
-
         try:
+            logger.info("[BRANCH] _execute_summary 调用 _prepare_messages")
             full_text, all_images, msg_count = await self._prepare_messages(event, start_time, end_time)
+            logger.info(f"[BRANCH] _execute_summary _prepare_messages 返回: msg_count={msg_count}, 图片数={len(all_images)}")
         except Exception as e:
+            logger.info(f"[BRANCH] _execute_summary _prepare_messages 异常: {e}")
             await event.send(event.plain_result(f"准备消息失败：{str(e)}"))
             return None
 
         if msg_count == 0:
-            # 日志输出无消息的情况，便于调试
+            logger.info("[BRANCH] _execute_summary msg_count=0，无消息")
             logger.info("=" * 50)
             logger.info(f"【回顾/调试】关键词：{keyword}，消息数：0")
             if parsed.get('mode') == 'time':
@@ -570,7 +836,6 @@ class PluginSummary(Star):
             await event.send(event.plain_result("在指定时间范围内没有找到任何消息。"))
             return None
 
-        # 构造提示词
         system_prompt = """请将以下议题对应的群聊记录整理为一份详细的 WikiText 归档。请严格遵守以下要求：
 
 == 语法要求 ==
@@ -616,15 +881,13 @@ class PluginSummary(Star):
 使用连贯、精炼的语言，确保逻辑清晰。"""
         user_prompt = f"关键词：{keyword}\n\n最近消息：\n{full_text}\n请总结与“{keyword}”相关的讨论。"
 
-        # 完整日志输出（两种模式完全一致）
+        # 日志输出
         logger.info("=" * 50)
         logger.info(f"【回顾/调试】关键词：{keyword}，消息数：{msg_count}，图片数：{len(all_images)}")
-        # 时间模式额外打印起止时间
         if parsed.get('mode') == 'time':
             start_dt = datetime.fromtimestamp(parsed['start']).strftime('%Y-%m-%d %H:%M:%S')
             end_dt = datetime.fromtimestamp(parsed['end']).strftime('%Y-%m-%d %H:%M:%S')
             logger.info(f"时间范围：{start_dt} 至 {end_dt}")
-        #logger.info(f"System Prompt:\n{system_prompt}")
         logger.info(f"User Prompt:\n{user_prompt}")
         logger.info(f"消息内容：\n{full_text}")
         if all_images:
@@ -632,32 +895,59 @@ class PluginSummary(Star):
         logger.info("=" * 50)
 
         return full_text, all_images, msg_count, keyword, system_prompt, user_prompt
-
+    @filter.command("测试合并转发")
+    async def test_forward(self, event: AstrMessageEvent):
+        """测试合并转发功能：发送插件自身的源代码"""
+        logger.info("[BRANCH] test_forward 进入")
+        
+        # 检查是否在群聊中（可选）
+        if not event.message_obj.group_id:
+            await event.send(event.plain_result("此命令只能在群聊中使用。"))
+            return
+        
+        # 读取当前文件（main.py）的内容
+        import os
+        file_path = os.path.abspath(__file__)
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            logger.error(f"[BRANCH] test_forward 读取文件失败: {e}")
+            await event.send(event.plain_result(f"读取文件失败: {e}"))
+            return
+        
+        # 发送合并转发消息
+        await self._send_as_forward(event, content)
+        logger.info("[BRANCH] test_forward 完成")
+    # ---------- 指令：回顾 ----------
     @filter.command("回顾")
     async def summarize_by_keyword(self, event: AstrMessageEvent):
+        logger.info("[BRANCH] summarize_by_keyword 进入")
         result = await self._execute_summary(event)
         if result is None:
+            logger.info("[BRANCH] summarize_by_keyword _execute_summary 返回 None，退出")
             return
         full_text, all_images, msg_count, keyword, system_prompt, user_prompt = result
 
         provider = await self.context.get_using_provider_async(umo=event.unified_msg_origin)
-        if not provider:
-            await event.send(event.plain_result("未找到可用的 LLM 提供商。"))
-            return
+        # if not provider:
+            # logger.info("[BRANCH] summarize_by_keyword 未找到 LLM 提供商，发送错误")
+            # await event.send(event.plain_result("未找到可用的 LLM 提供商。"))
+            # return
+        # logger.info("[BRANCH] summarize_by_keyword 获取到 provider")
 
         full_response = ""
-        buffer = ""          # 累积缓冲区
+        buffer = ""
         chunk_counter = 0
-        log_threshold = 100  # 每收集200字符打印一次
+        log_threshold = 100
 
         try:
+            logger.info("[BRANCH] summarize_by_keyword 开始流式调用")
             stream = provider.text_chat_stream(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 image_urls=all_images if all_images else None
             )
-
-            logger.info("[STREAM] 开始接收流式响应")
 
             async for chunk in stream:
                 if chunk.is_chunk:
@@ -667,36 +957,42 @@ class PluginSummary(Star):
                         buffer += chunk_text
                         chunk_counter += 1
                         if len(buffer) >= log_threshold:
-                            logger.info(f"[STREAM] 累计片段 #{chunk_counter}，新增内容: {buffer}")
+                            logger.info(f"[BRANCH] summarize_by_keyword 流式片段 #{chunk_counter}: {buffer}")
                             buffer = ""
 
-            # 流结束后打印剩余缓冲
             if buffer:
-                logger.info(f"[STREAM] 流结束，剩余片段内容: {buffer}")
-            logger.info(f"[STREAM] 流式响应结束，共 {chunk_counter} 个片段，总长度 {len(full_response)} 字符")
+                logger.info(f"[BRANCH] summarize_by_keyword 剩余缓冲区: {buffer}")
+            logger.info(f"[BRANCH] summarize_by_keyword 流式结束，总长度 {len(full_response)}")
 
             if full_response.strip():
-                await event.send(event.plain_result(f"关于“{keyword}”的群聊总结\n\n{full_response}"))
+                await self._send_as_forward(event, full_response)
             else:
-                logger.warning("流式响应未返回有效内容，尝试非流式重试")
+                logger.warning("[BRANCH] summarize_by_keyword 流式响应为空，尝试非流式")
                 llm_resp = await provider.text_chat(
                     prompt=user_prompt,
                     system_prompt=system_prompt,
                     image_urls=all_images if all_images else None
                 )
                 summary = llm_resp.completion_text or "LLM 未返回有效总结。"
-                await self._send_as_forward(event, summary, title=f"关于“{keyword}”的群聊总结")
+                await self._send_as_forward(event, summary)
         except Exception as e:
-            logger.error(f"LLM 调用异常: {e}", exc_info=True)
+            logger.error(f"[BRANCH] summarize_by_keyword 异常: {e}", exc_info=True)
             await event.send(event.plain_result(f"调用 LLM 失败：{str(e)}"))
 
     # ---------- 指令：回debug顾 ----------
     @filter.command("回debug顾")
     async def debug_summarize(self, event: AstrMessageEvent):
+        logger.info("[BRANCH] debug_summarize 进入")
         result = await self._execute_summary(event)
         if result is None:
-            return
-        # 不发送任何额外消息，所有信息已在日志中
+            logger.info("[BRANCH] debug_summarize _execute_summary 返回 None，退出")
+        else:
+            logger.info("[BRANCH] debug_summarize 完成，所有信息已在日志中")
 
     async def terminate(self):
+        if hasattr(self, 'cov'):
+            self.cov.stop()
+            self.cov.save()
+            self.cov.html_report(directory='cov_html')
+            logger.info("[BRANCH] Coverage report saved to cov_html/")
         logger.info("插件 astrbot_plugin_summary 已卸载")
