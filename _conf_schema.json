@@ -1,0 +1,28 @@
+{
+  "wiki_api_url": {
+    "description": "Miraheze 的 MediaWiki API 地址（api.php），一般无需修改。",
+    "type": "string",
+    "default": "https://lumorganix.miraheze.org/w/api.php"
+  },
+  "wiki_username": {
+    "description": "Miraheze 机器人账号用户名（Bot 用户名）。",
+    "type": "string",
+    "default": "LumorganixBot"
+  },
+  "wiki_password": {
+    "description": "Miraheze 机器人密码（Bot password）。此项为 secret，管理面板会以密码框遮罩显示，但配置文件中仍为明文，请勿提交到公开仓库。",
+    "type": "string",
+    "secret": true,
+    "default": ""
+  },
+  "wiki_target_page": {
+    "description": "「测试wiki上传」指令写入的目标 wiki 页面标题。",
+    "type": "string",
+    "default": "User:LumorganixBot/src"
+  },
+  "timezone": {
+    "description": "解析「开始/结束」时间以及显示消息时间所用的时区。填 IANA 时区名（如 Asia/Shanghai、America/New_York），也可填固定偏移（如 +8、-5、UTC+8）。留空则使用服务器本地时区。",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  }
+}
