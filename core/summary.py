@@ -76,12 +76,9 @@ class SummaryMixin:
             await event.send(event.plain_result("在指定时间范围内没有找到任何消息。"))
             return None
 
-        # 图片先落地本地：QQ 直链有 rkey 时效，交给 LLM 前必须自己下载好，
-        # 否则任何一张抓取失败都会被静默跳过、造成编号整体错位（贴错图）。
-        try:
-            await self._materialize_images(image_meta)
-        except Exception as e:
-            logger.warning(f"[BRANCH] _execute_summary 图片本地化异常: {e}")
+        # 图片不预先下载到本地：GLM API / AStrBot API / MediaWiki API 都直接收
+        # QQ 图片直链（http(s)），交由各端自行抓取，省一次本地落盘。
+        # 原「下载落地避免直链时效错位」的逻辑保留在 _materialize_images，必要时再启用。
 
         system_prompt = """请将以下议题对应的群聊记录整理为一份详细的 WikiText 归档。请严格遵守以下要求：
 

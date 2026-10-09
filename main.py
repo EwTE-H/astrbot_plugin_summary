@@ -9,6 +9,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.message_components import Reply
+import coverage
 
 from .core.time_utils import TimeUtilsMixin
 from .core.args import ArgsMixin
@@ -29,9 +30,11 @@ class PluginSummary(TimeUtilsMixin, ArgsMixin, MessageMixin, ImageMixin, WikiMix
         self.default_days = 2
         self.max_messages = 1000
         self.max_text_chars = 50000
-        self.max_images = 20
-        self.max_upload_images = 20   # 单次归档最多往 wiki 传几张图（与 max_images 一致）
         logger.info("[BRANCH] PluginSummary __init__ 完成")
+        # 启动 coverage，只统计本插件目录
+        self.cov = coverage.Coverage(source=['.'])  # 或者写插件所在目录的绝对路径
+        self.cov.start()
+        logger.info("[BRANCH] Coverage started")
 
     @filter.command("测试合并转发")
     async def test_forward(self, event: AstrMessageEvent):
@@ -211,7 +214,7 @@ class PluginSummary(TimeUtilsMixin, ArgsMixin, MessageMixin, ImageMixin, WikiMix
 
 # ---------- 指令：回顾上传 ----------
 
-    @filter.command("回顾上传")
+    @filter.command("回顾上传backup")
     async def review_and_upload(self, event: AstrMessageEvent):
         """把「回顾」生成的归档正文写入 wiki 页面，并把正文引用的图片一并上传到 wiki。
 
@@ -231,8 +234,8 @@ class PluginSummary(TimeUtilsMixin, ArgsMixin, MessageMixin, ImageMixin, WikiMix
             await event.send(event.plain_result(
                 f"参数错误：{e}\n\n"
                 "用法：\n"
-                "  /回顾上传 <主题> <页面名称> <开始时间> <结束时间>\n"
-                "  /回顾上传 <主题> <页面名称>   （需引用一条群消息）\n"
+                "  /回顾上传backup <主题> <页面名称> <开始时间> <结束时间>\n"
+                "  /回顾上传backup <主题> <页面名称>   （需引用一条群消息）\n"
                 "页面名称中的空格请用下划线 _ 代替。"))
             return
         logger.info(f"[REVIEW-UP] 页面名={page_name!r} parsed={parsed}")
@@ -255,12 +258,11 @@ class PluginSummary(TimeUtilsMixin, ArgsMixin, MessageMixin, ImageMixin, WikiMix
             return
         full_text, all_images, msg_count, keyword, system_prompt, user_prompt, image_meta = result
 
-        await event.send(event.plain_result(
-            f"已取到 {msg_count} 条消息、{len(all_images)} 张图片，正在生成归档并上传到 "
-            f"{page_name} ……"))
+        logger.info(f"[REVIEW-UP] 已取到 {msg_count} 条消息、{len(all_images)} 张图片，页面={page_name}")
+        await event.send(event.plain_result("正在生成归档并上传，请稍候…"))
 
-        # 全部可用图（按编号升序），与文末清单顺序严格一致
-        img_refs = [m['local'] for m in image_meta if m.get('local')]
+        # 全部可用图（按编号升序），与文末清单顺序严格一致；直传 QQ 直链，不下本地
+        img_refs = [m['url'] for m in image_meta if m.get('url')]
         logger.info(f"[REVIEW-UP] 本次附带 {len(img_refs)} 张图给 LLM")
 
         try:
@@ -269,7 +271,7 @@ class PluginSummary(TimeUtilsMixin, ArgsMixin, MessageMixin, ImageMixin, WikiMix
                 tag="REVIEW-UP/llm", stream=False)
         except Exception as e:
             logger.error(f"[REVIEW-UP] LLM 调用失败: {e}", exc_info=True)
-            await event.send(event.plain_result(f"调用 LLM 失败：{str(e)}"))
+            await event.send(event.plain_result("生成失败，详见日志。"))
             return
 
         if not summary.strip():
@@ -279,7 +281,7 @@ class PluginSummary(TimeUtilsMixin, ArgsMixin, MessageMixin, ImageMixin, WikiMix
         refs = re.findall(r'\[图#(\d+)\]', summary)
         logger.info(f"[REVIEW-UP] 正文长度={len(summary)}，引用图片编号={refs}")
         # 兜底：正文引用了清单外（或已失效）的编号时，直接剔除
-        allowed = {m['n'] for m in image_meta if m.get('local')}
+        allowed = {m['n'] for m in image_meta if m.get('url')}
         dropped = sorted({int(r) for r in refs} - allowed)
         if dropped:
             logger.warning(f"[REVIEW-UP] 正文引用了清单外编号 {dropped}，已剔除对应标记")
@@ -287,17 +289,18 @@ class PluginSummary(TimeUtilsMixin, ArgsMixin, MessageMixin, ImageMixin, WikiMix
                 summary = re.sub(r'\[图#%d\][ \t]*\n?([ \t]*图注[:：].*)?\n?' % d, '', summary)
 
         try:
-            msg, final_text, mapping = await asyncio.to_thread(
+            msg, final_text, mapping, article_url = await asyncio.to_thread(
                 self._review_up_publish, summary, list(all_images),
                 wiki_api_url, wiki_username, wiki_password, page_name,
                 list(image_meta))
         except Exception as e:
             logger.error(f"[REVIEW-UP] wiki 上传异常: {e}", exc_info=True)
-            await event.send(event.plain_result(f"wiki 上传失败：{e}"))
+            await event.send(event.plain_result("上传失败，详见日志。"))
             return
 
-        # 原文照例发一份给群里，便于人工核对（上传版已将 [图#N] 换成 File: 引用）
-        await event.send(event.plain_result(msg))
+        # 技术信息（字节数/版本号/图片张数）只写日志，不刷群；群里只发归档链接，对群友有用
+        logger.info(f"[REVIEW-UP] {msg}")
+        await event.send(event.plain_result(f"回顾已归档：{article_url}"))
         # 「编号 -> 原图来源 -> wiki 文件」对照表只写日志，不再发群（避免刷屏）
         try:
             table = [f"图#{n} <- {info['src']} -> {info['file']}"
@@ -308,21 +311,246 @@ class PluginSummary(TimeUtilsMixin, ArgsMixin, MessageMixin, ImageMixin, WikiMix
         except Exception as e:
             logger.warning(f"[REVIEW-UP] 记录对照表失败: {e}")
         try:
-            await self._send_as_forward(event, summary)
+            # 合并转发里把 [图#N] 渲染成真实图片（与 wiki 上 [[File:...|thumb]] 对应）
+            img_map = {m['n']: m['url'] for m in image_meta if m.get('url')}
+            if img_map:
+                await self._send_as_forward_with_images(event, summary, img_map)
+                logger.info(f"[REVIEW-UP] 合并转发已附图，编号数={len(img_map)}")
+            else:
+                await self._send_as_forward(event, summary)
         except Exception as e:
             logger.warning(f"[REVIEW-UP] 转发原文失败（不影响已上传结果）: {e}")
         logger.info("[REVIEW-UP] review_and_upload 完成")
+
+    @filter.command("回顾上传")
+    async def review_and_upload_test(self, event: AstrMessageEvent):
+        """同 /回顾上传，但 LLM 直连 GLM API（图文混排），绕过 AStrBot。
+        API Key 取自配置项 glm_api_key（secret，不在代码中硬编码）。"""
+        logger.info("[REVIEW-UP-TEST] review_and_upload_test 进入")
+
+        page_name = ""
+        parsed = None
+        try:
+            page_name, parsed = self._review_up_parse_args(event)
+        except ValueError as e:
+            await event.send(event.plain_result(
+                f"参数错误：{e}\n\n"
+                "用法：\n"
+                "  /回顾上传 <主题> <页面名> <开始时间> <结束时间>\n"
+                "  /回顾上传 <主题> <页面名>   （需引用一条群消息）\n"
+                "页面名称中的空格请用下划线 _ 代替。"))
+            return
+
+        glm_api_key = (self.config.get("glm_api_key", "") or "").strip()
+        glm_model = (self.config.get("glm_model", "") or "").strip() or "glm-5.3-flash"
+        glm_base_url = (self.config.get("glm_base_url", "") or "").strip() or \
+            "https://open.bigmodel.cn/api/paas/v4"
+        if not glm_api_key:
+            await event.send(event.plain_result(
+                "未配置 glm_api_key。请在 AStrBot 管理面板 → 插件配置中填写 glm_api_key（secret 项）。"))
+            return
+
+        wiki_api_url = (self.config.get("wiki_api_url", "") or "").strip() or \
+            'https://lumorganix.miraheze.org/w/api.php'
+        wiki_username = (self.config.get("wiki_username", "") or "").strip()
+        wiki_password = self.config.get("wiki_password", "") or ""
+        if not wiki_username or not wiki_password:
+            await event.send(event.plain_result(
+                "尚未配置 wiki 账号或密码。请在 AStrBot 管理面板 → 插件配置中填写 "
+                "wiki_username 与 wiki_password。"))
+            return
+
+        result = await self._execute_summary(event, parsed_override=parsed, attached=True)
+        if result is None:
+            return
+        full_text, all_images, msg_count, keyword, system_prompt, user_prompt, image_meta = result
+
+        # 「回顾上传test」prompt 可配置化：配置非空则覆盖内置默认，仅作用于本指令
+        glm_sys_cfg = (self.config.get("glm_system_prompt") or "").strip()
+        glm_usr_tpl = (self.config.get("glm_user_prompt_template") or "").strip()
+        if glm_sys_cfg:
+            system_prompt = glm_sys_cfg
+            logger.info("[REVIEW-UP-TEST] 使用配置 glm_system_prompt 覆盖内置 system 提示")
+        if glm_usr_tpl:
+            try:
+                manifest = self._build_image_manifest(image_meta, attached=True)
+                user_prompt = glm_usr_tpl.format(keyword=keyword, full_text=full_text, manifest=manifest)
+                logger.info("[REVIEW-UP-TEST] 使用配置 glm_user_prompt_template 重建 user 提示")
+            except (KeyError, IndexError) as e:
+                logger.warning(f"[REVIEW-UP-TEST] user 模板占位符错误({e})，回退内置拼接")
+
+        logger.info(f"[REVIEW-UP-TEST] 已取到 {msg_count} 条消息、{len(all_images)} 张图片，页面={page_name}")
+        await event.send(event.plain_result("正在生成归档并上传，请稍候…"))
+
+        try:
+            summary = await self._run_summary_glm_direct(
+                system_prompt, user_prompt, image_meta, glm_api_key, glm_model, glm_base_url)
+        except Exception as e:
+            logger.error(f"[REVIEW-UP-TEST] GLM 调用失败: {e}", exc_info=True)
+            await event.send(event.plain_result("生成失败，详见日志。"))
+            return
+
+        if not summary.strip():
+            await event.send(event.plain_result("GLM 未返回有效内容，已取消上传。"))
+            return
+
+        refs = re.findall(r'\[图#(\d+)\]', summary)
+        allowed = {m['n'] for m in image_meta if m.get('url')}
+        dropped = sorted({int(r) for r in refs} - allowed)
+        if dropped:
+            logger.warning(f"[REVIEW-UP-TEST] 正文引用了清单外编号 {dropped}，已剔除对应标记")
+            for d in dropped:
+                summary = re.sub(r'\[图#%d\][ \t]*\n?([ \t]*图注[:：].*)?\n?' % d, '', summary)
+
+        try:
+            msg, final_text, mapping, article_url = await asyncio.to_thread(
+                self._review_up_publish, summary, list(all_images),
+                wiki_api_url, wiki_username, wiki_password, page_name,
+                list(image_meta))
+        except Exception as e:
+            logger.error(f"[REVIEW-UP-TEST] wiki 上传异常: {e}", exc_info=True)
+            await event.send(event.plain_result("上传失败，详见日志。"))
+            return
+
+        logger.info(f"[REVIEW-UP-TEST] {msg}")
+        await event.send(event.plain_result(f"回顾已归档：{article_url}"))
+        try:
+            table = [f"图#{n} <- {info['src']} -> {info['file']}"
+                     for n, info in sorted(mapping.items())]
+            if table:
+                logger.info("[REVIEW-UP-TEST] 图片对照表（图#N <- 来源 -> wiki 文件）：\n"
+                            + "\n".join(table))
+        except Exception as e:
+            logger.warning(f"[REVIEW-UP-TEST] 记录对照表失败: {e}")
+        try:
+            img_map = {m['n']: m['url'] for m in image_meta if m.get('url')}
+            if img_map:
+                await self._send_as_forward_with_images(event, summary, img_map)
+                logger.info(f"[REVIEW-UP-TEST] 合并转发已附图，编号数={len(img_map)}")
+            else:
+                await self._send_as_forward(event, summary)
+        except Exception as e:
+            logger.warning(f"[REVIEW-UP-TEST] 转发原文失败（不影响已上传结果）: {e}")
+        logger.info("[REVIEW-UP-TEST] review_and_upload_test 完成")
 
     # ---------- 回顾上传：参数解析 ----------
 
     @filter.command("回debug顾")
     async def debug_summarize(self, event: AstrMessageEvent):
-        logger.info("[BRANCH] debug_summarize 进入")
-        result = await self._execute_summary(event)
-        if result is None:
-            logger.info("[BRANCH] debug_summarize _execute_summary 返回 None，退出")
-        else:
-            logger.info("[BRANCH] debug_summarize 完成，所有信息已在日志中")
+        """调试：扫描区间内图片的 subType，验证「表情包(表情)筛选」可行性。
+        用法与 /回顾 完全一致：
+          /回debug顾 <开始时间> <结束时间>        （时间模式）
+          /回debug顾 <关键词>                     （需引用一条群消息，用其时间）
+          /回debug顾                              （默认最近 default_days 天）
+        不调用 LLM、不上传 wiki，只输出筛选统计，并限制拉取量防止刷爆日志。"""
+        logger.info("[DBG-SIEVE] debug_summarize 进入")
+        if not event.message_obj.group_id:
+            await event.send(event.plain_result("此命令只能在群聊中使用。"))
+            return
+
+        # 复用 /回顾 的参数解析（语法一致）；debug 不需要 keyword，但时间模式照样支持
+        raw = event.message_str.strip()
+        parts = raw.split()
+        args = parts[1:]
+        start_time = end_time = None
+        if args:
+            try:
+                parsed = self._parse_args(args)
+            except ValueError as e:
+                await event.send(event.plain_result(f"参数错误：{str(e)}"))
+                return
+            if parsed.get('mode') == 'time':
+                start_time = parsed.get('start')
+                end_time = parsed.get('end')
+            # quote 模式：start_time 留空，下面用引用消息时间填充
+
+        platform = self.context.get_platform('aiocqhttp')
+        client = platform.get_client() if platform else None
+        if not client:
+            await event.send(event.plain_result("无法获取 QQ 协议端客户端。"))
+            return
+
+        self_id = event.message_obj.self_id
+        group_id = event.message_obj.group_id
+
+        # 引用消息 → 以引用时间作为起点（与 /回顾 一致）
+        if start_time is None:
+            for seg in event.message_obj.message:
+                if isinstance(seg, Reply):
+                    try:
+                        msg_resp = await client.api.call_action('get_msg', message_id=int(seg.id))
+                        if msg_resp and 'time' in msg_resp:
+                            start_time = msg_resp['time']
+                    except Exception as e:
+                        logger.warning(f"[DBG-SIEVE] 获取引用消息时间失败: {e}")
+                    break
+
+        # 限制拉取量：活跃群一次拉几千条会把 terminal.log 冲爆
+        max_dbg = 800
+        try:
+            full_text, all_images, msg_count, image_meta = await self._fetch_and_filter(
+                client, group_id, start_time, end_time, self_id,
+                collect_subtype=True, max_messages=max_dbg, filter_meme=False)
+        except Exception as e:
+            logger.error(f"[DBG-SIEVE] 拉取失败: {e}", exc_info=True)
+            await event.send(event.plain_result(f"拉取消息失败：{e}"))
+            return
+
+        if not image_meta:
+            await event.send(event.plain_result(
+                f"区间内未检测到图片（共扫描 {msg_count} 条消息，上限 {max_dbg}）。"))
+            logger.info("[DBG-SIEVE] 无图片，结束")
+            return
+
+        # 统计 subType 分布，并分别记录被剔除 / 保留的具体图片（回答「哪些被筛掉了」）
+        dropped = []   # 表情包(subType=1)，即会被筛掉的
+        kept = []     # 其余保留的
+        for m in image_meta:
+            st = m.get('subType')
+            ctx = (m.get('ctx', '') or '').replace('\n', ' ').strip()
+            entry = (m['n'], st, m.get('sender', ''), m.get('ts', ''), ctx)
+            if st == 1:
+                dropped.append(entry)
+            else:
+                kept.append(entry)
+        total = len(image_meta)
+        normal = sum(1 for m in image_meta if m.get('subType') == 0)
+        meme = len(dropped)
+        gif = sum(1 for m in image_meta if m.get('subType') == 2)
+        unknown = sum(1 for m in image_meta if m.get('subType') is None)
+
+        def _tag(st):
+            return '表情包' if st == 1 else '普通' if st == 0 else 'GIF' if st == 2 else '未知'
+
+        lines = [
+            f"[调试·表情包筛选] 区间内图片共 {total} 张（群消息 {msg_count} 条）",
+            f"subType 分布：普通图(0)={normal}，表情包(1)={meme}，GIF(2)={gif}，未知={unknown}",
+            f"→ 按「仅剔除表情包(subType=1)」：保留 {len(kept)} 张，剔除 {meme} 张",
+        ]
+        # 被剔除的（用户最关心：到底哪些图被筛掉了）
+        if dropped:
+            lines.append("")
+            lines.append(f"【被剔除的表情包（共 {len(dropped)} 张）】")
+            for n, st, sender, ts, ctx in dropped:
+                snippet = (ctx[:40] + '…') if len(ctx) > 40 else ctx
+                lines.append(f"  图#{n} [表情包] {sender} {ts} {snippet}")
+        # 保留的（紧凑一行，过长截断）
+        if kept:
+            lines.append("")
+            lines.append(f"【保留的（共 {len(kept)} 张）】")
+            kept_str = "  " + " ".join(f"图#{n}[{_tag(st)}]" for n, st, *_ in kept)
+            if len(kept_str) > 1500:
+                kept_str = kept_str[:1500] + " …"
+            lines.append(kept_str)
+
+        summary = "\n".join(lines)
+        await event.send(event.plain_result(summary))
+        logger.info(f"[DBG-SIEVE] 完成：{summary}")
 
     async def terminate(self):
+        if hasattr(self, 'cov'):
+            self.cov.stop()
+            self.cov.save()
+            self.cov.html_report(directory='cov_html')
+            logger.info("[BRANCH] Coverage report saved to cov_html/")
         logger.info("插件 astrbot_plugin_summary 已卸载")

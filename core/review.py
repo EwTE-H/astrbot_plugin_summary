@@ -5,6 +5,7 @@ import re
 import asyncio
 from datetime import datetime, date
 from typing import List, Optional, Tuple, Dict
+from urllib.parse import quote, urlparse
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Reply
@@ -101,15 +102,6 @@ class ReviewMixin:
                 wanted.append(n)
         logger.info(f"[REVIEW-UP] 需要上传的图片编号: {wanted}")
 
-        # 上限保护：超出部分直接从正文里把标记去掉，避免页面上留一排「图片上传失败」
-        cap = getattr(self, 'max_upload_images', 12)
-        if len(wanted) > cap:
-            over = wanted[cap:]
-            logger.warning(f"[REVIEW-UP] 引用图片 {len(wanted)} 张超过上限 {cap}，丢弃编号 {over}")
-            for n in over:
-                wikitext = re.sub(r'\[图#%d\][ \t]*\n?([ \t]*图注[:：].*)?\n?' % n, '', wikitext)
-            wanted = wanted[:cap]
-
         file_map = {}
         failed = []
         meta_by_n = {m['n']: m for m in (image_meta or [])}
@@ -176,11 +168,25 @@ class ReviewMixin:
         final_text = re.sub(r'\[图#(\d+)\][ \t]*\n[ \t]*图注[:：][ \t]*.*', r'[图#\1]', wikitext)
         final_text = re.sub(r'\[图#(\d+)\]', _sub, final_text)
 
-        j = sess.post(api_url, data={
-            'action': 'edit', 'title': page_title, 'text': final_text,
+        # 检查页面是否已存在：存在则追加到末尾（带分隔线），不存在则新建（避免覆盖历史归档）
+        q = sess.post(api_url, data={
+            'action': 'query', 'titles': page_title, 'prop': 'info', 'format': 'json',
+        }).json()
+        pages = (q.get('query') or {}).get('pages') or {}
+        exists = not any(p.get('missing') is not None for p in pages.values())
+        edit_data = {
+            'action': 'edit', 'title': page_title,
             'summary': f'review upload: 群聊回顾归档（{len(wanted)} 张图）',
             'token': csrf, 'assert': 'user', 'format': 'json',
-        }).json()
+        }
+        if exists:
+            # 追加时在前面补一个空行，避免新内容直接贴在旧内容末尾（否则标题/段落粘连）
+            edit_data['appendtext'] = "\n\n" + final_text
+            logger.info(f"[REVIEW-UP] 页面 {page_title} 已存在，追加到末尾（前置空行）")
+        else:
+            edit_data['text'] = final_text
+            logger.info(f"[REVIEW-UP] 页面 {page_title} 不存在，新建")
+        j = sess.post(api_url, data=edit_data).json()
         if j.get('edit', {}).get('result') != 'Success':
             raise RuntimeError(f"编辑失败: {json.dumps(j, ensure_ascii=False)}")
 
@@ -190,11 +196,15 @@ class ReviewMixin:
         if failed:
             info += f"，失败编号：{','.join(str(x) for x in failed)}"
 
+        # 文章访问链接：域名取自 api_url，标题做百分号编码（中文 -> %XX，避免链接含非 ASCII）
+        _p = urlparse(api_url)
+        article_url = f"{_p.scheme}://{_p.netloc}/wiki/{quote(page_title.replace(' ', '_'))}"
+
         mapping = {}
         for n, fn in file_map.items():
             m = (meta_by_n.get(n) or {})
             src = f"{m.get('ts','')} {m.get('sender','')}".strip() or f"图#{n}"
             mapping[n] = {'file': fn, 'src': src}
-        return info, final_text, mapping
+        return info, final_text, mapping, article_url
 
     # ---------- 指令：回debug顾 ----------

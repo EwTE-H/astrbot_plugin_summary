@@ -84,9 +84,9 @@ class ImageMixin:
         # 默认只列「已成功下载到本地」的图，保证清单里的编号一定可用；
         # only 显式指定时按调用方给的编号列（调用方已确保这些图可用）。
         if only is None:
-            items = [m for m in image_meta if m.get('local')]
+            items = [m for m in image_meta if m.get('url')]
         else:
-            items = [m for m in image_meta if m['n'] in only and m.get('local')]
+            items = [m for m in image_meta if m['n'] in only and m.get('url')]
         if not items:
             return ""
         if attached:
@@ -100,7 +100,7 @@ class ImageMixin:
         for m in items:
             src = f"{m.get('ts','')} {m.get('sender','')}".strip()
             ctx = (m.get('ctx') or '').strip()
-            status = '' if m.get('local') else '（该图已失效，禁止引用）'
+            status = '' if m.get('url') else '（该图已失效，禁止引用）'
             head = f"* [图#{m['n']}] 来源：{src}"
             if ctx:
                 head += f"，上下文：{ctx}"
